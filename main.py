@@ -1,8 +1,11 @@
 import sys
 import os
+import struct
+import zlib
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDialog, 
                              QVBoxLayout, QHBoxLayout, QWidget, QListWidget, QCheckBox,
-                             QLabel, QMenu, QAction, QMessageBox, QProgressBar, QFrame, QLineEdit)
+                             QLabel, QMenu, QAction, QMessageBox, QProgressBar, QFrame, QLineEdit,
+                             QDialog, QTextEdit, QScrollArea, QGroupBox, QGridLayout, QSizePolicy)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon, QDragEnterEvent, QDropEvent, QColor, QPalette, QFont
 from PIL import Image
@@ -41,7 +44,7 @@ def set_application_icon(app, icon_name):
 class ImageProcessor(QThread):
     progress_updated = pyqtSignal(int)
     task_completed = pyqtSignal(str)
-    all_tasks_completed = pyqtSignal()
+    all_tasks_completed = pyqtSignal(dict)  # 传递处理统计结果
     
     def __init__(self, image_paths, output_dir, keep_original_name):
         super().__init__()
@@ -50,6 +53,13 @@ class ImageProcessor(QThread):
         self.keep_original_name = keep_original_name
         self.is_running = True
         
+        # 初始化PNG块处理器
+        self.png_processor = PNGBlockProcessor()
+        
+        # 初始化统计变量
+        self.processed_files = []  # 成功处理的文件列表
+        self.failed_files = []     # 处理失败的文件列表
+    
     def run(self):
         total = len(self.image_paths)
         for i, image_path in enumerate(self.image_paths):
@@ -67,34 +77,230 @@ class ImageProcessor(QThread):
                 
                 output_path = os.path.join(self.output_dir, filename)
                 
-                # 打开图片
-                img = Image.open(image_path)
-                
-                # 保存图片，但不包含元数据
-                img_format = img.format
-                if img_format == 'JPEG':
-                    # 对于JPEG，我们可以使用piexif来删除所有元数据
-                    img_without_exif = Image.new(img.mode, img.size)
-                    img_without_exif.putdata(list(img.getdata()))
-                    img_without_exif.save(output_path, format=img_format, quality=100)
+                # 使用新的PNG流式算法处理PNG文件
+                if self.png_processor.is_png_file(image_path):
+                    # 使用高效的块处理算法
+                    success = self.png_processor.process_png_streaming(image_path, output_path)
+                    if not success:
+                        raise Exception("PNG块处理失败")
                 else:
-                    # 对于其他格式，直接保存而不添加元数据
-                    img_without_exif = Image.new(img.mode, img.size)
-                    img_without_exif.putdata(list(img.getdata()))
-                    img_without_exif.save(output_path, format=img_format)
+                    # 对于非PNG文件，仍然使用原来的PIL方法
+                    self._process_non_png_image(image_path, output_path, filename)
                 
+                # 记录成功处理的文件
+                self.processed_files.append(filename)
                 self.task_completed.emit(f"已处理: {filename}")
             except Exception as e:
+                # 记录处理失败的文件
+                self.failed_files.append(filename)
                 self.task_completed.emit(f"处理失败: {filename} - {str(e)}")
             
             # 更新进度
             progress = int((i + 1) / total * 100)
             self.progress_updated.emit(progress)
         
-        self.all_tasks_completed.emit()
+        # 准备统计结果
+        stats = {
+            'total_files': total,
+            'successful': len(self.processed_files),
+            'failed': len(self.failed_files),
+            'processed_files': self.processed_files.copy(),
+            'failed_files': self.failed_files.copy()
+        }
+        
+        # 发送完成信号并传递统计数据
+        self.all_tasks_completed.emit(stats)
+    
+    def _process_non_png_image(self, image_path: str, output_path: str, filename: str):
+        """处理非PNG格式的图像文件（使用原有的PIL方法）"""
+        try:
+            # 打开图片
+            img = Image.open(image_path)
+            
+            # 保存图片，但不包含元数据
+            img_format = img.format
+            if img_format == 'JPEG':
+                # 对于JPEG，我们可以使用piexif来删除所有元数据
+                img_without_exif = Image.new(img.mode, img.size)
+                img_without_exif.putdata(list(img.getdata()))
+                img_without_exif.save(output_path, format=img_format, quality=100)
+            else:
+                # 对于其他格式，直接保存而不添加元数据
+                img_without_exif = Image.new(img.mode, img.size)
+                img_without_exif.putdata(list(img.getdata()))
+                img_without_exif.save(output_path, format=img_format)
+        except Exception as e:
+            raise Exception(f"非PNG图像处理失败: {str(e)}")
     
     def stop(self):
         self.is_running = False
+
+
+# 处理结果统计对话框
+class ProcessingResultsDialog(QDialog):
+    """处理结果统计对话框"""
+    
+    def __init__(self, parent, stats):
+        super().__init__(parent)
+        self.stats = stats
+        self.init_ui()
+    
+    def init_ui(self):
+        self.setWindowTitle("处理结果统计")
+        self.setModal(True)
+        self.setMinimumSize(500, 400)
+        
+        # 创建布局
+        layout = QVBoxLayout()
+        
+        # 标题
+        title_label = QLabel("📊 处理结果统计")
+        title_font = QFont()
+        title_font.setPointSize(14)
+        title_font.setBold(True)
+        title_label.setFont(title_font)
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+        
+        # 统计概览
+        overview_group = QGroupBox("📈 统计概览")
+        overview_layout = QGridLayout()
+        
+        # 总文件数
+        overview_layout.addWidget(QLabel("总文件数:"), 0, 0)
+        total_label = QLabel(str(self.stats['total_files']))
+        total_label.setStyleSheet("font-weight: bold; color: blue;")
+        overview_layout.addWidget(total_label, 0, 1)
+        
+        # 成功处理数
+        overview_layout.addWidget(QLabel("成功处理:"), 1, 0)
+        success_label = QLabel(str(self.stats['successful']))
+        success_label.setStyleSheet("font-weight: bold; color: green;")
+        overview_layout.addWidget(success_label, 1, 1)
+        
+        # 失败数
+        overview_layout.addWidget(QLabel("处理失败:"), 2, 0)
+        failed_label = QLabel(str(self.stats['failed']))
+        failed_label.setStyleSheet("font-weight: bold; color: red;")
+        overview_layout.addWidget(failed_label, 2, 1)
+        
+        # 成功率
+        if self.stats['total_files'] > 0:
+            success_rate = (self.stats['successful'] / self.stats['total_files']) * 100
+            overview_layout.addWidget(QLabel("成功率:"), 3, 0)
+            rate_label = QLabel(f"{success_rate:.1f}%")
+            rate_label.setStyleSheet("font-weight: bold; color: purple;")
+            overview_layout.addWidget(rate_label, 3, 1)
+        
+        overview_group.setLayout(overview_layout)
+        layout.addWidget(overview_group)
+        
+        # 成功文件列表
+        if self.stats['processed_files']:
+            success_group = QGroupBox(f"✅ 成功处理的文件 ({len(self.stats['processed_files'])})")
+            success_layout = QVBoxLayout()
+            
+            # 使用滚动区域来显示成功文件列表
+            success_scroll = QScrollArea()
+            success_scroll.setWidgetResizable(True)
+            success_scroll.setMaximumHeight(200)  # 增加高度限制
+            
+            success_text = QTextEdit()
+            success_text.setReadOnly(True)
+            success_text.setWordWrapMode(True)  # 启用文本换行
+            success_text.setPlainText('\n'.join(self.stats['processed_files']))
+            success_text.setStyleSheet("""
+                QTextEdit {
+                    background-color: #f8f9fa;
+                    border: 1px solid #dee2e6;
+                    border-radius: 4px;
+                    padding: 8px;
+                    font-family: 'Courier New', monospace;
+                    font-size: 9pt;
+                }
+            """)
+            
+            success_scroll.setWidget(success_text)
+            success_layout.addWidget(success_scroll)
+            
+            success_group.setLayout(success_layout)
+            layout.addWidget(success_group)
+        
+        # 失败文件列表
+        if self.stats['failed_files']:
+            failed_group = QGroupBox(f"❌ 处理失败的文件 ({len(self.stats['failed_files'])})")
+            failed_layout = QVBoxLayout()
+            
+            # 使用滚动区域来显示失败文件列表
+            failed_scroll = QScrollArea()
+            failed_scroll.setWidgetResizable(True)
+            failed_scroll.setMaximumHeight(200)  # 增加高度限制
+            
+            failed_text = QTextEdit()
+            failed_text.setReadOnly(True)
+            failed_text.setWordWrapMode(True)  # 启用文本换行
+            failed_text.setPlainText('\n'.join(self.stats['failed_files']))
+            failed_text.setStyleSheet("""
+                QTextEdit {
+                    background-color: #fff5f5;
+                    border: 1px solid #fed7d7;
+                    border-radius: 4px;
+                    padding: 8px;
+                    font-family: 'Courier New', monospace;
+                    font-size: 9pt;
+                }
+            """)
+            
+            failed_scroll.setWidget(failed_text)
+            failed_layout.addWidget(failed_scroll)
+            
+            failed_group.setLayout(failed_layout)
+            layout.addWidget(failed_group)
+        
+        # 按钮
+        button_layout = QHBoxLayout()
+        
+        ok_btn = QPushButton("确定")
+        ok_btn.clicked.connect(self.accept)
+        ok_btn.setDefault(True)
+        button_layout.addWidget(ok_btn)
+        
+        # 复制按钮
+        copy_btn = QPushButton("复制结果")
+        copy_btn.clicked.connect(self.copy_results)
+        button_layout.addWidget(copy_btn)
+        
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+    
+    def copy_results(self):
+        """复制统计结果到剪贴板"""
+        result_text = f"处理结果统计\n"
+        result_text += f"==================\n"
+        result_text += f"总文件数: {self.stats['total_files']}\n"
+        result_text += f"成功处理: {self.stats['successful']}\n"
+        result_text += f"处理失败: {self.stats['failed']}\n"
+        
+        if self.stats['total_files'] > 0:
+            success_rate = (self.stats['successful'] / self.stats['total_files']) * 100
+            result_text += f"成功率: {success_rate:.1f}%\n"
+        
+        if self.stats['processed_files']:
+            result_text += f"\n成功处理的文件:\n"
+            for file in self.stats['processed_files']:
+                result_text += f"  ✓ {file}\n"
+        
+        if self.stats['failed_files']:
+            result_text += f"\n处理失败的文件:\n"
+            for file in self.stats['failed_files']:
+                result_text += f"  ✗ {file}\n"
+        
+        # 复制到剪贴板
+        clipboard = QApplication.clipboard()
+        clipboard.setText(result_text)
+        
+        QMessageBox.information(self, "已复制", "统计结果已复制到剪贴板！")
 
 
 class MainWindow(QMainWindow):
@@ -337,17 +543,181 @@ class MainWindow(QMainWindow):
     def update_task_status(self, message):
         self.statusBar().showMessage(message, 3000)  # 显示3秒
     
-    def on_all_tasks_completed(self):
+    def on_all_tasks_completed(self, stats):
         # 重新启用按钮
         self.execute_btn.setEnabled(True)
         self.import_btn.setEnabled(True)
         self.output_btn.setEnabled(True)
         
-        # 显示完成消息
-        QMessageBox.information(self, "完成", "所有任务已完成！")
+        # 显示统计结果对话框
+        results_dialog = ProcessingResultsDialog(self, stats)
+        results_dialog.exec_()
         
         # 重置进度条
         self.progress_bar.setValue(0)
+
+
+# PNG块处理器 - 基于流的元数据去除算法
+class PNGBlockProcessor:
+    """高效PNG元数据去除器 - 基于块的流式处理算法"""
+    
+    # PNG文件签名 (8字节)
+    PNG_SIGNATURE = b'\x89\x50\x4E\x47\x0D\x0A\x1A\x0A'
+    
+    # 关键块 (Critical Chunks) - 必须保留
+    CRITICAL_CHUNKS = {'IHDR', 'PLTE', 'IDAT', 'IEND'}
+    
+    # 安全辅助块白名单 - 对图像显示重要但不包含工作流
+    SAFE_ANCILLARY_CHUNKS = {
+        'sRGB',   # sRGB颜色空间
+        'gAMA',   # Gamma校正
+        'iCCP',   # ICC颜色配置文件
+        'pHYs',   # 物理像素尺寸
+        'cHRM',   # 色度信息
+        'bKGD',   # 背景色
+        'hIST',   # 直方图
+        'tRNS',   # 透明度信息
+    }
+    
+    # 需要丢弃的块类型（包含工作流元数据）
+    METADATA_CHUNKS = {
+        'tEXt', 'zTXt', 'iTXt',  # 文本元数据
+        'eXIf',                   # EXIF数据
+        'tIME',                   # 最后修改时间
+    }
+    
+    def __init__(self):
+        pass
+    
+    def process_png_streaming(self, input_path: str, output_path: str) -> bool:
+        """
+        流式处理PNG文件 - 只重组文件结构，完全不碰图像数据
+        
+        Args:
+            input_path: 输入PNG文件路径
+            output_path: 输出PNG文件路径
+            
+        Returns:
+            bool: 处理是否成功
+        """
+        try:
+            with open(input_path, 'rb') as input_file, \
+                 open(output_path, 'wb') as output_file:
+                
+                # 1. 验证并写入PNG签名
+                signature = input_file.read(8)
+                if signature != self.PNG_SIGNATURE:
+                    raise ValueError("不是有效的PNG文件")
+                output_file.write(signature)
+                
+                # 2. 流式处理所有数据块
+                chunks_processed = 0
+                chunks_skipped = 0
+                
+                while True:
+                    # 读取块头信息 (8字节: 长度4字节 + 类型4字节)
+                    chunk_header = input_file.read(8)
+                    if len(chunk_header) != 8:
+                        break
+                    
+                    chunk_length, chunk_type = struct.unpack('>I4s', chunk_header)
+                    
+                    # 读取块数据
+                    chunk_data = input_file.read(chunk_length)
+                    if len(chunk_data) != chunk_length:
+                        raise ValueError(f"块数据不完整: {chunk_type}")
+                    
+                    # 读取CRC校验
+                    chunk_crc = input_file.read(4)
+                    if len(chunk_crc) != 4:
+                        raise ValueError(f"CRC校验不完整: {chunk_type}")
+                    
+                    # 3. 决策逻辑：保留或丢弃块
+                    chunk_type_str = chunk_type.decode('ascii')
+                    
+                    # 关键块必须保留
+                    is_critical = chunk_type_str in self.CRITICAL_CHUNKS
+                    
+                    # 安全辅助块可以保留
+                    is_safe_ancillary = chunk_type_str in self.SAFE_ANCILLARY_CHUNKS
+                    
+                    # 需要丢弃的元数据块
+                    is_metadata = chunk_type_str in self.METADATA_CHUNKS
+                    
+                    # 4. 写入决策
+                    if is_critical or is_safe_ancillary:
+                        # 这是"好"块，原封不动写回
+                        output_file.write(chunk_header)
+                        output_file.write(chunk_data)
+                        output_file.write(chunk_crc)
+                        chunks_processed += 1
+                    elif is_metadata:
+                        # 这是"坏"块（包含工作流），直接跳过
+                        chunks_skipped += 1
+                    else:
+                        # 未知的辅助块，默认保留以确保兼容性
+                        output_file.write(chunk_header)
+                        output_file.write(chunk_data)
+                        output_file.write(chunk_crc)
+                        chunks_processed += 1
+                        print(f"警告: 保留未知类型的块: {chunk_type_str}")
+                    
+                    # 5. 检查是否到达文件末尾
+                    if chunk_type_str == 'IEND':
+                        break
+                
+                print(f"处理完成: 保留{chunks_processed}个块，跳过{chunks_skipped}个元数据块")
+                return True
+                
+        except Exception as e:
+            print(f"PNG处理失败: {str(e)}")
+            return False
+    
+    def is_png_file(self, file_path: str) -> bool:
+        """检查文件是否为PNG格式"""
+        try:
+            with open(file_path, 'rb') as f:
+                signature = f.read(8)
+                return signature == self.PNG_SIGNATURE
+        except:
+            return False
+    
+    def get_file_info(self, file_path: str) -> dict:
+        """获取PNG文件的基本信息"""
+        try:
+            with open(file_path, 'rb') as f:
+                # 跳过PNG签名
+                f.seek(8)
+                
+                # 读取IHDR块
+                chunk_header = f.read(8)
+                if len(chunk_header) != 8:
+                    return {}
+                
+                chunk_length, chunk_type = struct.unpack('>I4s', chunk_header)
+                
+                if chunk_type.decode('ascii') != 'IHDR':
+                    return {}
+                
+                # IHDR块长度固定为13字节
+                ihdr_data = f.read(13)
+                if len(ihdr_data) != 13:
+                    return {}
+                
+                # 解析IHDR数据
+                width, height, bit_depth, color_type, compression_method, \
+                filter_method, interlace_method = struct.unpack('>IIBBBBB', ihdr_data)
+                
+                return {
+                    'width': width,
+                    'height': height,
+                    'bit_depth': bit_depth,
+                    'color_type': color_type,
+                    'is_png': True
+                }
+        except Exception as e:
+            print(f"获取文件信息失败: {str(e)}")
+            return {'is_png': False}
 
 
 if __name__ == "__main__":
